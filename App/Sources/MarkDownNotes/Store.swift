@@ -54,26 +54,39 @@ final class NotesStore: ObservableObject {
     private var monitors: [DirectoryMonitor] = []
     private var allFiles: [NoteFile] = []
 
-    init() {
+    /// Every folder the user has added, in sidebar order — including ones that are
+    /// offline right now (an external volume not mounted yet). Only this list is
+    /// saved, so a slow mount at login never makes the app forget a folder.
+    private var savedRoots: [URL] = []
+
+    private static let fallbackRoot = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Documents/MarkDownNotes").standardizedFileURL
+
+    /// The saved roots reachable now, or the fallback folder (unsaved) when none are.
+    private static func availableRoots(_ saved: [URL]) -> [URL] {
         let fm = FileManager.default
+        let online = saved.filter { fm.fileExists(atPath: $0.path) }
+        if !online.isEmpty { return online }
+        try? fm.createDirectory(at: fallbackRoot, withIntermediateDirectories: true)
+        return [fallbackRoot]
+    }
+
+    init() {
         let storedList = UserDefaults.standard.stringArray(forKey: "notesRootPaths")
             ?? UserDefaults.standard.string(forKey: "notesRootPath").map { [$0] }
             ?? []
-        var rootURLs = storedList
-            .map { URL(fileURLWithPath: $0).standardizedFileURL }
-            .filter { fm.fileExists(atPath: $0.path) }
+        savedRoots = storedList.map { URL(fileURLWithPath: $0).standardizedFileURL }
 
         var seedTarget: URL?
-        if rootURLs.isEmpty {
-            let fallback = fm.homeDirectoryForCurrentUser
-                .appendingPathComponent("Documents/MarkDownNotes").standardizedFileURL
-            try? fm.createDirectory(at: fallback, withIntermediateDirectories: true)
-            rootURLs = [fallback]
-            seedTarget = fallback
+        if savedRoots.isEmpty {
+            savedRoots = [Self.fallbackRoot]
+            seedTarget = Self.fallbackRoot
         }
+        let rootURLs = Self.availableRoots(savedRoots)
         roots = rootURLs
         selection = .folder(rootURLs[0])
         persistRoots()
+        let fm = FileManager.default
 
         recentFolders = (UserDefaults.standard.stringArray(forKey: "recentFolderPaths") ?? [])
             .map { URL(fileURLWithPath: $0) }
@@ -89,10 +102,37 @@ final class NotesStore: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.flushSaveNow() }
         }
+        // Pick up saved folders on volumes that mount after launch (and drop ones that go away).
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.volumesChanged() }
+            }
+        }
     }
 
     private func persistRoots() {
-        UserDefaults.standard.set(roots.map(\.path), forKey: "notesRootPaths")
+        UserDefaults.standard.set(savedRoots.map(\.path), forKey: "notesRootPaths")
+    }
+
+    private func volumesChanged() {
+        let now = Self.availableRoots(savedRoots)
+        guard now != roots else { return }
+        flushSaveNow()
+        roots = now
+        let isUnderRoot = { (path: String) in
+            self.roots.contains { path == $0.path || path.hasPrefix($0.path + "/") }
+        }
+        if let note = selectedNote, !isUnderRoot(note.url.path) {
+            selectedNote = nil; text = ""; savedText = ""
+        }
+        if case .folder(let dir) = selection, !isUnderRoot(dir.path) {
+            selection = .folder(roots[0])
+        }
+        rescan()
+        installMonitors()
+        if selectedNote == nil, let first = notes.first { select(first) }
     }
 
     var currentFolderURL: URL {
@@ -311,8 +351,9 @@ final class NotesStore: ObservableObject {
         guard !roots.contains(where: { $0.path == url.path }) else {
             changeSelection(.folder(url)); return
         }
-        roots.append(url)
+        if !savedRoots.contains(where: { $0.path == url.path }) { savedRoots.append(url) }
         persistRoots()
+        roots = Self.availableRoots(savedRoots)
         rescan()
         installMonitors()
         changeSelection(.folder(url))
@@ -321,8 +362,9 @@ final class NotesStore: ObservableObject {
     func removeRoot(_ url: URL) {
         guard roots.count > 1 else { return }
         flushSaveNow()
-        roots.removeAll { $0.path == url.path }
+        savedRoots.removeAll { $0.path == url.path }
         persistRoots()
+        roots = Self.availableRoots(savedRoots)
         if let note = selectedNote, note.url.path.hasPrefix(url.path + "/") {
             selectedNote = nil; text = ""; savedText = ""
         }

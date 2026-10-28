@@ -48,7 +48,8 @@ and need right-click → **Open** the first time.)
 
 On first run the app creates `~/Documents/MarkDownNotes` with a welcome
 note. Add more folders via **File → Add Notes Folder…** (⇧⌘O); remove
-one from the sidebar via right-click.
+one from the sidebar via right-click. Folders on an external drive stay in
+your library while it's disconnected and reappear when it mounts.
 
 ## Build from source
 
